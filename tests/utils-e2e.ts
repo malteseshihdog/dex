@@ -11,6 +11,7 @@ import {
 } from '../src/implementations/local-paraswap-sdk';
 import {
   EstimateGasSimulation,
+  SimulationResult,
   TenderlySimulation,
   TransactionSimulator,
 } from './tenderly-simulation';
@@ -40,6 +41,7 @@ import { GIFTER_ADDRESS, Holders, Tokens } from './constants-e2e';
 import { generateDeployBytecode, sleep } from './utils';
 import { assert } from 'ts-essentials';
 import * as util from 'util';
+import { BigNumber, ethers } from 'ethers';
 
 export const testingEndpoint = process.env.E2E_TEST_ENDPOINT;
 
@@ -266,7 +268,7 @@ export function formatDeployMessage(
 export async function testE2E(
   srcToken: Token,
   destToken: Token,
-  senderAddress: Address,
+  _senderAddress: Address,
   _amount: string,
   swapSide = SwapSide.SELL,
   dexKey: string,
@@ -281,6 +283,7 @@ export async function testE2E(
   sleepMs?: number,
   replaceTenderlyWithEstimateGas?: boolean,
 ) {
+  const sender = ethers.Wallet.createRandom().address;
   const amount = BigInt(_amount);
 
   const ts: TransactionSimulator = replaceTenderlyWithEstimateGas
@@ -290,10 +293,16 @@ export async function testE2E(
 
   if (srcToken.address.toLowerCase() !== ETHER_ADDRESS.toLowerCase()) {
     const allowanceTx = await ts.simulate(
-      allowTokenTransferProxyParams(srcToken.address, senderAddress, network),
+      allowTokenTransferProxyParams(srcToken.address, sender, network),
     );
     if (!allowanceTx.success) console.log(allowanceTx.url);
     expect(allowanceTx!.success).toEqual(true);
+  } else {
+    const addBalanceTx = await ts.addBalance(
+      sender,
+      BigNumber.from(_amount).toHexString(),
+    );
+    expect(addBalanceTx.success).toEqual(true);
   }
 
   if (deployedTestContractAddress) {
@@ -396,10 +405,34 @@ export async function testE2E(
     const swapParams = await paraswap.buildTransaction(
       priceRoute,
       minMaxAmount,
-      senderAddress,
+      sender,
     );
 
-    const swapTx = await ts.simulate(swapParams);
+    const address = generateConfig(network).tokenTransferProxyAddress;
+
+    let swapTx: SimulationResult;
+    // When the source token is not ETH, we brute force the storage slots for all known balances and allowances
+    if (srcToken.address.toLowerCase() !== ETHER_ADDRESS.toLowerCase()) {
+      const multipliedAmount = BigNumber.from(amount).mul(2).toString();
+      swapTx = await ts.simulate(swapParams, {
+        networkID: network.toString(),
+        stateOverrides: {
+          [`${srcToken.address.toLowerCase()}`]: {
+            value: {
+              [`balances[${sender}]`]: multipliedAmount,
+              [`_balances[${sender}]`]: multipliedAmount,
+              [`balanceOf[${sender}]`]: multipliedAmount,
+              [`allowance[${sender}][${address.toLowerCase()}]`]:
+                multipliedAmount,
+              [`_allowances[${sender}][${address.toLowerCase()}]`]:
+                multipliedAmount,
+            },
+          },
+        },
+      });
+    } else {
+      swapTx = await ts.simulate(swapParams);
+    }
     // Only log gas estimate if testing against API
     if (useAPI) {
       const gasUsed = swapTx.gasUsed || '0';
